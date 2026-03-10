@@ -30,7 +30,6 @@ import discord
 import logging
 import subprocess
 import undetected_chromedriver as uc
-import praw
 import random
 
 # Set up logging

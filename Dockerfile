@@ -10,7 +10,7 @@ RUN apt-get update && \
     wget \
     gnupg \
     libnss3-dev \
-    libgdk-pixbuf2.0-dev \
+    libgdk-pixbuf-xlib-2.0-dev \
     libgtk-3-dev \
     libxss-dev \
     libasound2 \
@@ -21,6 +21,7 @@ RUN apt-get update && \
     ffmpeg \
     fonts-liberation \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 
 # Install Google Chrome
 RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \

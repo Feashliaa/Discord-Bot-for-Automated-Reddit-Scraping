@@ -121,45 +121,28 @@ class WebScraper:
 
     async def process_gallery(self, post, title, interaction, nsfw):
         try:
-            print(f"Interaction type: {type(interaction)}, Interaction: {interaction}")
+            perm_url = post.get("permalink")
+            reddit_post_url = urljoin("https://www.reddit.com", perm_url)
 
-            if not hasattr(interaction, "followup"):
-                raise ValueError(
-                    "The interaction object does not have the expected 'followup' attribute."
-                )
+            # NSFW label if needed
+            prefix = "NSFW: " if nsfw else ""
 
-            gallery_data = post.get("gallery_data", {}).get("items", [])
-            media_metadata = post.get("media_metadata", {})
+            # Send without angle brackets so Discord auto-embeds the preview
+            message = f"{prefix}{title}\n{reddit_post_url}"
+            print(f"Gallery post detected — sending preview link: {reddit_post_url}")
 
-            # Process only the first item in the gallery
-            if gallery_data:
-                item = gallery_data[0]
-                media_id = item.get("media_id")
-                if media_id:
-                    media_info = media_metadata.get(media_id, {})
-                    mime_type = media_info.get("m", "")
-                    url = f"https://i.redd.it/{media_id}.jpg"
-
-                    if mime_type.startswith("image"):
-                        await self.process_image(
-                            url, title, post["url"], interaction, nsfw
-                        )
-                    elif mime_type.startswith("video"):
-                        await self.process_video(
-                            url, title, post["url"], interaction, nsfw
-                        )
-                    elif mime_type.endswith("gif"):
-                        await self.process_gif(
-                            url, title, post["url"], interaction, nsfw
-                        )
-                    else:
-                        print(f"Unknown media type for {media_id}")
+            if interaction and hasattr(interaction, "followup"):
+                await interaction.followup.send(message)
+            else:
+                print(f"[process_gallery] No interaction context; skipping Discord send for: {reddit_post_url}")
 
         except Exception as e:
             print("Error processing gallery content:", e)
-            await interaction.followup.send(
-                f"An unexpected error occurred while processing the gallery: {e}"
-            )
+            if interaction and hasattr(interaction, "followup"):
+                await interaction.followup.send(
+                    f"Error processing gallery for {title}: {e}"
+                )
+
 
     # Process the image and send it to the Discord channel
     async def process_image(
@@ -319,16 +302,29 @@ class WebScraper:
         self, gif_url, title, reddit_post_url=None, interaction=None, nsfw=False
     ):
         print("Gif URL:", gif_url)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(gif_url) as response:
-                content = await response.read()
 
         gif_filename = sanitize_filename(f"{title}.gif")
 
-        with open(gif_filename, "wb") as file:
-            file.write(content)
+        # Stream download safely
+        async with aiohttp.ClientSession() as session:
+            async with session.get(gif_url) as response:
+                with open(gif_filename, "wb") as f:
+                    async for chunk in response.content.iter_chunked(8192):
+                        f.write(chunk)
 
-        title_payload = {"content": f"{title}\n<{reddit_post_url}>"}
+        # Skip oversized GIFs (Discord limit)
+        if os.path.getsize(gif_filename) > 25 * 1024 * 1024:
+            if interaction and hasattr(interaction, "followup"):
+                await interaction.followup.send(f"{title}\n{gif_url}")
+            else:
+                print(
+                    f"[process_gif] No interaction; skipping Discord send for large file: {gif_url}"
+                )
+            os.remove(gif_filename)
+            return
+
+        # Send to Discord
+        title_payload = {"content": f"{title}\n<{reddit_post_url or gif_url}>"}
         files = {"file": open(gif_filename, "rb")}
 
         await self.send_to_discord_channel(title_payload, files, interaction)
