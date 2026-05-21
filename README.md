@@ -27,6 +27,28 @@ Discord's upload limit is 50MB (Level 2 boost). When a video exceeds this, Sipho
 - **Compress** - Re-encodes at 480p with a calculated bitrate to fit under the limit. Only offered when the video is short enough for compression to produce a watchable result (≥500kbps video bitrate).
 - **Split into parts** - Splits the video into chunks using stream copy (no quality loss). Each part is labeled with timestamps, e.g. `Video Title (Part 2/4 - 2:30–5:00)`.
 
+## Deployment Architecture
+
+SiphonBot uses a **hybrid serverless + container** architecture on Azure:
+
+```
+Discord ──┐
+          ├─→ Container App (Discord bot) ──→ Service Bus Queue
+          │                            └──→ (inline processing fallback)
+          │
+          └─→ Service Bus Queue ──→ Azure Function App (worker) ──→ Discord Webhook
+```
+
+- **Discord bot** (Azure Container App): Listens for commands, either processes media inline or enqueues to Service Bus
+- **Media worker** (Azure Function App): Dequeues jobs from Service Bus, processes them, posts results via Discord webhook
+- **Queue**: Azure Service Bus for reliable job orchestration and decoupling
+
+### Why Hybrid Mode?
+
+- **Responsiveness**: Discord users get immediate acknowledgment (ephemeral message) without waiting for long downloads
+- **Reliability**: Failed jobs are automatically retried with dead-letter tracking via Service Bus
+- **Scalability**: Worker can scale independently of the Discord bot
+
 ## Setup
 
 ### Environment variables
@@ -41,7 +63,25 @@ REDDIT_USERNAME=your_username
 REDDIT_PASSWORD=your_password
 DISCORD_TOKEN=your_discord_bot_token
 WEBHOOK=your_discord_webhook_url
+SERVICE_BUS_CONNECTION_STRING=Endpoint=sb://...;SharedAccessKeyName=...;SharedAccessKey=...
+SERVICE_BUS_QUEUE_NAME=siphon-queue
+MEDIA_TMP_DIR=/tmp/siphon
 ```
+
+**Queue Mode** (if SERVICE_BUS_CONNECTION_STRING is set):
+- The Container App bot enqueues scrape/media jobs to Service Bus
+- The Azure Function worker dequeues, processes, and posts results via Discord webhook
+- Both bot and worker track delivery failures and dead-letter messages
+
+**Fallback Mode** (if SERVICE_BUS_CONNECTION_STRING is not set):
+- Bot processes all commands inline (no queueing)
+- All responses sent directly to Discord channel or user
+
+For Azure Container Apps deployment, configure secret values in GitHub repository secrets.
+The CI/CD workflow writes these values into the Container App secrets section and maps
+runtime environment variables using `secretref:` entries.
+
+Container media downloads use ephemeral mounted storage (`EmptyDir`) at `/tmp/siphon`.
 
 ### Run with Docker
 
@@ -68,6 +108,47 @@ docker compose up -d --build
 docker compose down && docker compose up -d --build && docker logs -f siphon_bot
 ```
 
+## Logging
+
+Log verbosity is controlled by the `LOG_LEVEL` environment variable (default: `INFO`).
+
+| Level   | Output                                                                                                          |
+| ------- | --------------------------------------------------------------------------------------------------------------- |
+| `INFO`  | Startup phases, secret source (Container App API vs env vars), HTTP status, present/missing key summary         |
+| `DEBUG` | All of the above plus each secret name → config key mapping (values masked as `abcd****`), per-key resolved status |
+
+### Azure Container Apps — change log level without redeploying
+
+```bash
+# Enable verbose debug logging
+az containerapp update \
+  -g siphon_bot \
+  -n siphonbot-app \
+  --set-env-vars LOG_LEVEL=DEBUG
+
+# Revert to normal
+az containerapp update \
+  -g siphon_bot \
+  -n siphonbot-app \
+  --set-env-vars LOG_LEVEL=INFO
+```
+
+Then tail logs:
+
+```bash
+az containerapp logs show -g siphon_bot -n siphonbot-app --follow
+```
+
+You can also set `LOG_LEVEL` in the Azure Portal under **Container Apps → siphonbot-app → Containers → Environment variables**.
+
+### Local / Docker
+
+Add `LOG_LEVEL=DEBUG` to your `.env` file, or pass it inline:
+
+```bash
+LOG_LEVEL=DEBUG docker compose up
+```
+
 ## Project structure
 
 ```
@@ -87,6 +168,13 @@ docker compose down && docker compose up -d --build && docker logs -f siphon_bot
 └── text_files/
     └── requirements.txt
 ```
+
+## Backlog
+
+- **Offload `/download` to the Function App** — `/scrape` commands already enqueue work to the Azure Service Bus queue for async processing by the Function App, but `/download` (YouTube / yt-dlp) still runs in-process inside the Container App. Offloading it would keep the bot responsive when multiple downloads are queued simultaneously. Blockers to address:
+  - The Function App (Consumption plan Linux) has no `ffmpeg` binary — it would need to be bundled as a self-contained executable or the plan switched to Premium/Dedicated.
+  - A new `download_video` job type must be added to `azure_functions/shared/media_processor.py`.
+  - The bot's `/download` handler must be wired to `queue_publisher.enqueue_download_job(...)` (analogous to the existing `enqueue_scrape_job`).
 
 ## Dependencies
 
